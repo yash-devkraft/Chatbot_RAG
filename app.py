@@ -7,6 +7,13 @@ import streamlit as st
 import google.generativeai as genai
 from dotenv import load_dotenv
 import traceback
+# Updated RAG-related imports
+from langchain_huggingface import HuggingFaceEmbeddings  # Updated import
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS  # Using community vectorstores
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
 
@@ -70,6 +77,103 @@ def chunk_text(text, max_chunk_size=8000):
     return chunks
 
 
+# RAG-specific functions
+def create_vector_store(text):
+    """Create a vector store from the document text using FAISS"""
+    try:
+        # Create a text splitter for more effective chunking
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len
+        )
+
+        # Split text into chunks
+        chunks = text_splitter.split_text(text)
+
+        # Create metadata for each chunk to trace them back to the document
+        texts = chunks
+        metadatas = [{"source": f"chunk_{i}"} for i in range(len(chunks))]
+
+        # Initialize the embedding model (using a free, local model from HuggingFace)
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'}
+        )
+
+        # Create the vector store
+        vector_store = FAISS.from_texts(texts=texts, embedding=embeddings, metadatas=metadatas)
+
+        return vector_store
+
+    except Exception as e:
+        st.error(f"Error creating vector store: {str(e)}")
+        st.error(traceback.format_exc())
+        return None
+
+
+def setup_rag_chain(vector_store):
+    """Set up the RAG chain with the vector store"""
+    try:
+        # Create a memory object to store conversation history
+        memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True,
+            output_key="answer"  # Specify which output to store in memory
+        )
+
+        # Create the LLM using Gemini
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.0-flash",
+            google_api_key=GEMINI_API_KEY,
+            temperature=0.3,
+            top_p=0.95,
+            top_k=40,  # Use a positive value
+            max_output_tokens=1024,
+        )
+
+        # Create the conversational retrieval chain
+        chain = ConversationalRetrievalChain.from_llm(
+            llm=llm,
+            retriever=vector_store.as_retriever(search_kwargs={"k": 3}),
+            memory=memory,
+            return_source_documents=True,
+            verbose=True  # Add this for debugging
+        )
+
+        return chain
+
+    except Exception as e:
+        st.error(f"Error setting up RAG chain: {str(e)}")
+        st.error(traceback.format_exc())
+        return None
+
+
+def rag_answer_question(rag_chain, question):
+    """Answer a question using the RAG chain"""
+    try:
+        # Query the RAG chain
+        response = rag_chain({"question": question})
+
+        # Extract the answer and source documents
+        answer = response.get("answer", "")
+        source_docs = response.get("source_documents", [])
+
+        # Format sources for display
+        sources = []
+        for i, doc in enumerate(source_docs):
+            source = doc.metadata.get("source", f"Source {i + 1}")
+            content_preview = doc.page_content[:100] + "..." if len(doc.page_content) > 100 else doc.page_content
+            sources.append(f"**{source}**: {content_preview}")
+
+        return answer, sources
+
+    except Exception as e:
+        st.error(f"Error answering question with RAG: {str(e)}")
+        st.error(traceback.format_exc())
+        return "Error processing your question. Please try again.", []
+
+
 def generate_summary(text):
     """Generate a summary of the document using Gemini API"""
     try:
@@ -102,6 +206,7 @@ def generate_summary(text):
         st.error(traceback.format_exc())
         return None
 
+
 def generate_bullet_points(text):
     """Generate bullet points from the document using Gemini API"""
     try:
@@ -120,10 +225,8 @@ def generate_bullet_points(text):
             generation_config=generation_config,
         )
 
-
         for i, chunk in enumerate(chunks):
             try:
-
                 prompt = f"""
                 Extract 5-10 key points from the following text as bullet points.
                 Format each point with a bullet (•) at the beginning.
@@ -189,57 +292,9 @@ def generate_bullet_points(text):
         return None
 
 
-def answer_question(text, question):
-    """Answer a question based on the document content using Gemini API"""
-    try:
-        chunks = chunk_text(text)
-        answers = []
-
-        generation_config = {
-            "temperature": 0.3,
-            "top_p": 0.95,
-            "top_k": 0,
-            "max_output_tokens": 1024,
-        }
-
-        model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
-            generation_config=generation_config,
-        )
-
-
-        for i, chunk in enumerate(chunks):
-            prompt = f"Based on the following text, please answer the question accurately and concisely. If the answer is not in the text, say 'I don't have enough information in the document to answer this question.'\n\nText: {chunk}\n\nQuestion: {question}"
-
-            response = model.generate_content(prompt)
-            chunk_answer = response.text.strip()
-
-            if not "don't have enough information" in chunk_answer.lower() and not "cannot answer" in chunk_answer.lower():
-                answers.append(chunk_answer)
-
-
-        if answers:
-            if len(answers) > 1:
-                combined_answer = " ".join(answers)
-
-                refine_prompt = f"Based on these extracted answers, provide a single coherent answer to the question: '{question}'\n\nExtracted answers: {combined_answer}"
-
-                refine_response = model.generate_content(refine_prompt)
-                return refine_response.text.strip()
-            else:
-                return answers[0]
-        else:
-            return "I don't have enough information in the document to answer this question."
-
-    except Exception as e:
-        st.error(f"Error answering question: {str(e)}")
-        st.error(traceback.format_exc())
-        return "Error processing your question. Please try again."
-
-
 def main():
     # Set page configuration
-    st.set_page_config(page_title="Document Q&A Bot (Gemini)", page_icon="📄", layout="wide")
+    st.set_page_config(page_title="Document Q&A Bot", page_icon="📄", layout="wide")
 
     # Apply custom CSS styling
     st.markdown("""
@@ -325,6 +380,17 @@ def main():
         margin-bottom: 20px;
     }
 
+    /* Source containers */
+    .source-container {
+        background-color: #f0f2f6;
+        border-left: 5px solid #80868b;
+        padding: 10px;
+        border-radius: 5px;
+        margin-top: 5px;
+        margin-bottom: 10px;
+        font-size: 0.9em;
+    }
+
     /* Text input */
     .stTextInput input {
         border-radius: 20px;
@@ -367,9 +433,16 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
+    # Add a sidebar for debug information
+    st.sidebar.title("Debug Information")
+
     # Initialize session state variables if they don't exist
     if 'document_text' not in st.session_state:
         st.session_state.document_text = None
+    if 'vector_store' not in st.session_state:
+        st.session_state.vector_store = None
+    if 'rag_chain' not in st.session_state:
+        st.session_state.rag_chain = None
 
     # App Header with custom styling
     st.markdown("""
@@ -395,6 +468,27 @@ def main():
 
         if document_text:
             st.session_state.document_text = document_text
+            st.sidebar.write(f"Document length: {len(document_text)} characters")
+
+            # Create RAG components if they don't exist
+            if st.session_state.vector_store is None:
+                with st.spinner("Setting up smart search system..."):
+                    st.session_state.vector_store = create_vector_store(document_text)
+
+                if st.session_state.vector_store:
+                    st.session_state.rag_chain = setup_rag_chain(st.session_state.vector_store)
+                    st.sidebar.write("✅ Vector store created successfully")
+                    st.sidebar.write("✅ Q&A system initialized successfully")
+
+                    st.markdown(f"""
+                    <div class="success-box">
+                        <h3 style="color: #4caf50; margin-top: 0;">✅ System Ready!</h3>
+                        <p>Successfully extracted text from <b>{uploaded_file.name}</b> and prepared for smart search.</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.sidebar.write("❌ Failed to create vector store")
+                    st.error("Failed to create search index. Please try uploading the document again.")
 
             st.markdown(f"""
             <div class="success-box">
@@ -405,26 +499,46 @@ def main():
 
             tab1, tab2, tab3 = st.tabs(["Q&A", "Summary", "Bullet Points"])
 
-            # Tab 1: Q&A
+            # Tab 1: Q&A with RAG
             with tab1:
                 st.markdown(
                     '<h2 style="text-align: center; color: #4285F4; margin-bottom: 20px;">Ask questions about the document</h2>',
                     unsafe_allow_html=True)
 
+                # Add info message without mentioning RAG
+                st.markdown("""
+                <div class="info-box">
+                    <p style="margin: 0;"><b>Smart Search Active:</b> Using semantic search for accurate answers.</p>
+                </div>
+                """, unsafe_allow_html=True)
+
                 question = st.text_input("Enter your question:", key="question_input")
 
                 if question:
-                    with st.spinner("Processing your question..."):
-                        answer = answer_question(document_text, question)
+                    if st.session_state.rag_chain:
+                        with st.spinner("Processing your question..."):
+                            answer, sources = rag_answer_question(st.session_state.rag_chain, question)
 
-                    st.markdown("""
-                    <div class="response-container">
-                        <h3 style="color: #4285F4; margin-top: 0;">Answer:</h3>
-                        <p>{}</p>
-                    </div>
-                    """.format(answer.replace("\n", "<br>")), unsafe_allow_html=True)
+                        st.markdown("""
+                        <div class="response-container">
+                            <h3 style="color: #4285F4; margin-top: 0;">Answer:</h3>
+                            <p>{}</p>
+                        </div>
+                        """.format(answer.replace("\n", "<br>")), unsafe_allow_html=True)
 
-                # Tab 2: Summary
+                        # Only show relevant document sections if they exist and are meaningful
+                        if sources and any(not s.endswith("...") for s in sources):
+                            st.markdown("<h4>Relevant Document Sections:</h4>", unsafe_allow_html=True)
+                            for source in sources:
+                                st.markdown(f"""
+                                <div class="source-container">
+                                    {source}
+                                </div>
+                                """, unsafe_allow_html=True)
+                    else:
+                        st.warning("Search system is not initialized. Please try uploading the document again.")
+
+            # Tab 2: Summary
             with tab2:
                 st.markdown(
                     '<h2 style="text-align: center; color: #4285F4; margin-bottom: 20px;">Document Summary</h2>',
@@ -442,9 +556,7 @@ def main():
                            </div>
                            """.format(summary.replace("\n", "<br>")), unsafe_allow_html=True)
 
-
-
-                # Tab 3: Bullet Points
+            # Tab 3: Bullet Points
             with tab3:
                 st.markdown('<h2 style="text-align: center; color: #4285F4; margin-bottom: 20px;">Key Points</h2>',
                             unsafe_allow_html=True)
@@ -461,8 +573,6 @@ def main():
                            </div>
                            """.format(bullet_points.replace("\n", "<br>").replace("• ", "• <b>").replace("•", "•</b>")),
                                     unsafe_allow_html=True)
-
-
                     else:
                         st.markdown("""
                            <div class="error-box">
@@ -479,7 +589,7 @@ def main():
             <div style="display: flex; justify-content: center; margin-top: 20px;">
                 <div style="text-align: center; padding: 15px; margin: 0 10px; background-color: white; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); width: 200px;">
                     <h3 style="color: #4285F4;">Ask Questions</h3>
-                    <p>Get answers to specific questions about your document</p>
+                    <p>Get accurate answers about your document content</p>
                 </div>
                 <div style="text-align: center; padding: 15px; margin: 0 10px; background-color: white; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); width: 200px;">
                     <h3 style="color: #4285F4;">Generate Summary</h3>
@@ -490,6 +600,16 @@ def main():
                     <p>Get the most important points as bullet points</p>
                 </div>
             </div>
+        </div>
+
+        <div style="background-color: white; padding: 20px; border-radius: 10px; margin: 30px 0;">
+            <h3 style="color: #4285F4;">How This App Works:</h3>
+            <ol>
+                <li><b>Document Processing:</b> Your document is converted into text and analyzed for content</li>
+                <li><b>Smart Search:</b> When you ask a question, the system finds the most relevant information</li>
+                <li><b>AI-Powered Answers:</b> The system generates accurate, context-aware responses to your questions</li>
+                <li><b>Helpful Context:</b> When relevant, you'll see document sections that support the answers</li>
+            </ol>
         </div>
         """, unsafe_allow_html=True)
 
